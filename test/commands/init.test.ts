@@ -6,21 +6,11 @@
  * mock.module (which leaks across test files).
  */
 
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  mock,
-  spyOn,
-  test,
-} from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import path from "node:path";
 import { initCommand } from "../../src/commands/init.js";
 // biome-ignore lint/performance/noNamespaceImport: spyOn requires object reference
 import * as projectsApi from "../../src/lib/api/projects.js";
-// biome-ignore lint/performance/noNamespaceImport: spyOn requires object reference
-import * as errorReportingNs from "../../src/lib/error-reporting.js";
 import {
   ApiError,
   ContextError,
@@ -46,30 +36,35 @@ let runWizardSpy: ReturnType<typeof spyOn>;
 let findProjectsSpy: ReturnType<typeof spyOn>;
 let warmSpy: ReturnType<typeof spyOn>;
 let exitSpy: ReturnType<typeof spyOn>;
-let reportCliErrorSpy: ReturnType<typeof spyOn>;
-
-type TestContext = {
-  cwd: string;
-  stdout: { write: (chunk: string) => boolean };
-  stderr: { write: ReturnType<typeof mock> };
-  stdin: typeof process.stdin;
-};
 
 const func = (await initCommand.loader()) as unknown as (
-  this: TestContext,
+  this: {
+    cwd: string;
+    stdout: { write: () => boolean };
+    stderr: { write: () => boolean };
+    stdin: typeof process.stdin;
+  },
   flags: Record<string, unknown>,
   first?: string,
   second?: string
 ) => Promise<void>;
 
-function makeContext(cwd = "/projects/app"): TestContext {
+function makeContext(cwd = "/projects/app") {
   return {
     cwd,
     stdout: { write: () => true },
-    // mock() so tests can inspect stderr.write calls for the error-path suite
-    stderr: { write: mock(() => true) },
+    stderr: { write: () => true },
     stdin: process.stdin,
   };
+}
+
+/**
+ * Drain any pending `setImmediate` callbacks. The init command schedules
+ * a forced `process.exit` via `setImmediate` in its `finally` block; tests
+ * need to await it before asserting on `exitSpy`.
+ */
+function flushImmediates(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 const DEFAULT_FLAGS = { yes: true, "dry-run": false } as const;
@@ -97,27 +92,22 @@ beforeEach(() => {
     () => {}
   );
   // The init command force-exits after the wizard to release Bun's fetch
-  // keep-alive sockets (src/commands/init.ts). Tests call `func` directly,
-  // so without this stub `process.exit` would terminate the test runner
-  // mid-suite.
+  // keep-alive sockets (src/commands/init.ts). The exit is scheduled via
+  // setImmediate, so tests can still await func — the stub just prevents
+  // the scheduled callback from actually terminating the test runner.
   exitSpy = spyOn(process, "exit").mockImplementation((() => {
     // intentionally no-op — see comment above
   }) as never);
-  // Silence Sentry reporting from the init error path; the behavior we
-  // care about (force-exit on failure) is asserted via exitSpy.
-  reportCliErrorSpy = spyOn(
-    errorReportingNs,
-    "reportCliError"
-    // biome-ignore lint/suspicious/noEmptyBlockStatements: intentional no-op mock
-  ).mockImplementation(() => {});
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Drain the force-exit setImmediate scheduled by init's `finally` so
+  // it doesn't fire during a later test and pollute exitSpy call counts.
+  await flushImmediates();
   runWizardSpy.mockRestore();
   findProjectsSpy.mockRestore();
   warmSpy.mockRestore();
   exitSpy.mockRestore();
-  reportCliErrorSpy.mockRestore();
   resetPrefetch();
 });
 
@@ -296,7 +286,7 @@ describe("init command func", () => {
       expect(capturedArgs?.project).toBeUndefined();
     });
 
-    test("bare slug in multiple orgs → force-exits with ValidationError", async () => {
+    test("bare slug in multiple orgs → throws ValidationError", async () => {
       findProjectsSpy.mockImplementation(async (slug: string) => ({
         projects: [mockProject(slug, "org-a"), mockProject(slug, "org-b")],
         orgs: [
@@ -305,11 +295,7 @@ describe("init command func", () => {
         ],
       }));
       const ctx = makeContext();
-      await func.call(ctx, DEFAULT_FLAGS, "my-app");
-      expect(runWizardSpy).not.toHaveBeenCalled();
-      expect(exitSpy).toHaveBeenCalledWith(1);
-      expect(reportCliErrorSpy).toHaveBeenCalledTimes(1);
-      expect(reportCliErrorSpy.mock.calls[0]?.[0]).toBeInstanceOf(
+      await expect(func.call(ctx, DEFAULT_FLAGS, "my-app")).rejects.toThrow(
         ValidationError
       );
     });
@@ -375,34 +361,25 @@ describe("init command func", () => {
   // ── Error cases ───────────────────────────────────────────────────────
 
   describe("error cases", () => {
-    // Argument/validation errors are caught by init's outer try/catch so
-    // the process still force-exits (issue #798). We assert the error
-    // type by inspecting the value passed to reportCliError.
-
-    test("two paths force-exits with ContextError", async () => {
+    test("two paths throws ContextError", async () => {
       const ctx = makeContext();
-      await func.call(ctx, DEFAULT_FLAGS, "./dir1", "./dir2");
-      expect(runWizardSpy).not.toHaveBeenCalled();
-      expect(exitSpy).toHaveBeenCalledWith(1);
-      expect(reportCliErrorSpy.mock.calls[0]?.[0]).toBeInstanceOf(ContextError);
+      await expect(
+        func.call(ctx, DEFAULT_FLAGS, "./dir1", "./dir2")
+      ).rejects.toThrow(ContextError);
     });
 
-    test("two targets force-exits with ContextError", async () => {
+    test("two targets throws ContextError", async () => {
       const ctx = makeContext();
-      await func.call(ctx, DEFAULT_FLAGS, "acme/", "other/");
-      expect(runWizardSpy).not.toHaveBeenCalled();
-      expect(exitSpy).toHaveBeenCalledWith(1);
-      expect(reportCliErrorSpy.mock.calls[0]?.[0]).toBeInstanceOf(ContextError);
+      await expect(
+        func.call(ctx, DEFAULT_FLAGS, "acme/", "other/")
+      ).rejects.toThrow(ContextError);
     });
 
     test("org slug with whitespace is rejected by validateResourceId", async () => {
       // Spaces in org slugs now hit validateResourceId and throw
       // ValidationError — normalizeSlug no longer converts them.
       const ctx = makeContext();
-      await func.call(ctx, DEFAULT_FLAGS, "acme corp/");
-      expect(runWizardSpy).not.toHaveBeenCalled();
-      expect(exitSpy).toHaveBeenCalledWith(1);
-      expect(reportCliErrorSpy.mock.calls[0]?.[0]).toBeInstanceOf(
+      await expect(func.call(ctx, DEFAULT_FLAGS, "acme corp/")).rejects.toThrow(
         ValidationError
       );
     });
@@ -487,90 +464,66 @@ describe("init command func", () => {
     });
   });
 
-  // ── Error paths — force-exit regression (issue #798) ──────────────────
+  // ── Force-exit scheduling (issue #798) ────────────────────────────────
   //
-  // The init command must call process.exit on failure as well as success,
-  // otherwise Bun's fetch keep-alive sockets and the forwarded /dev/tty
-  // stream keep the libuv loop alive and the shell hangs.
+  // `sentry init` schedules a `process.exit` via setImmediate in its
+  // `finally` block so the shell doesn't hang on Bun's fetch keep-alive
+  // sockets / forwarded /dev/tty after the command finishes. The error
+  // itself is left to Stricli's normal handler (app.ts:295) — init only
+  // ensures the process actually terminates.
 
-  describe("error paths — force exit", () => {
-    test("success path calls process.exit(0)", async () => {
+  describe("force-exit scheduling", () => {
+    test("schedules process.exit after successful wizard run", async () => {
+      exitSpy.mockClear();
       const ctx = makeContext();
       await func.call(ctx, DEFAULT_FLAGS);
-      expect(exitSpy).toHaveBeenCalledTimes(1);
+      await flushImmediates();
       expect(exitSpy).toHaveBeenCalledWith(0);
     });
 
-    test("rendered WizardError still calls process.exit and skips re-render", async () => {
+    test("schedules process.exit when the wizard throws", async () => {
       runWizardSpy.mockImplementation(() =>
         Promise.reject(new WizardError("boom", { rendered: true }))
       );
+      exitSpy.mockClear();
       const ctx = makeContext();
-      await func.call(ctx, DEFAULT_FLAGS);
-      expect(exitSpy).toHaveBeenCalledTimes(1);
-      expect(exitSpy).toHaveBeenCalledWith(1);
-      // Wizard already rendered via clack; we must NOT duplicate the message.
-      expect(ctx.stderr.write).not.toHaveBeenCalled();
-      expect(reportCliErrorSpy).toHaveBeenCalledTimes(1);
+      // Error still propagates — Stricli renders/reports it. We only
+      // verify init schedules the forced exit regardless.
+      await expect(func.call(ctx, DEFAULT_FLAGS)).rejects.toThrow(WizardError);
+      await flushImmediates();
+      expect(exitSpy).toHaveBeenCalled();
     });
 
-    test("unrendered WizardError is printed to stderr", async () => {
-      runWizardSpy.mockImplementation(() =>
-        Promise.reject(new WizardError("interactive only", { rendered: false }))
-      );
-      const ctx = makeContext();
-      await func.call(ctx, DEFAULT_FLAGS);
-      expect(exitSpy).toHaveBeenCalledWith(1);
-      expect(ctx.stderr.write).toHaveBeenCalledTimes(1);
-      const [msg] = ctx.stderr.write.mock.calls[0] ?? [];
-      expect(msg).toContain("interactive only");
-    });
-
-    test("unexpected non-CliError still calls process.exit(1) and is printed", async () => {
-      runWizardSpy.mockImplementation(() =>
-        Promise.reject(new Error("network down"))
-      );
-      const ctx = makeContext();
-      await func.call(ctx, DEFAULT_FLAGS);
-      expect(exitSpy).toHaveBeenCalledTimes(1);
-      expect(exitSpy).toHaveBeenCalledWith(1);
-      expect(ctx.stderr.write).toHaveBeenCalledTimes(1);
-      const [msg] = ctx.stderr.write.mock.calls[0] ?? [];
-      expect(msg).toContain("network down");
-      expect(reportCliErrorSpy).toHaveBeenCalledTimes(1);
-    });
-
-    test("pre-wizard API failure force-exits without calling the wizard", async () => {
+    test("schedules process.exit on pre-wizard API failure", async () => {
       findProjectsSpy.mockImplementation(() =>
         Promise.reject(new ApiError("Forbidden", 403))
       );
+      exitSpy.mockClear();
       const ctx = makeContext();
-      await func.call(ctx, DEFAULT_FLAGS, "some-project");
+      await expect(
+        func.call(ctx, DEFAULT_FLAGS, "some-project")
+      ).rejects.toThrow(ApiError);
       expect(runWizardSpy).not.toHaveBeenCalled();
-      expect(exitSpy).toHaveBeenCalledTimes(1);
-      // ApiError.exitCode is inherited from CliError (default 1)
-      expect(exitSpy.mock.calls[0]?.[0]).not.toBe(0);
-      expect(ctx.stderr.write).toHaveBeenCalledTimes(1);
-      const [msg] = ctx.stderr.write.mock.calls[0] ?? [];
-      expect(msg).toContain("Forbidden");
-      expect(reportCliErrorSpy).toHaveBeenCalledTimes(1);
+      await flushImmediates();
+      expect(exitSpy).toHaveBeenCalled();
     });
 
-    test("synchronous ValidationError also force-exits", async () => {
-      // resolveTarget throws synchronously for multi-match bare slugs;
-      // ValidationError extends CliError so it takes the CliError branch.
-      findProjectsSpy.mockImplementation(async () => ({
-        projects: [
-          { slug: "my-app", orgSlug: "org-a", id: "1", name: "my-app" },
-          { slug: "my-app", orgSlug: "org-b", id: "2", name: "my-app" },
-        ],
-        orgs: [MOCK_ORG],
-      }));
+    test("forwards Stricli-set exit code to process.exit", async () => {
+      runWizardSpy.mockImplementation(() =>
+        Promise.reject(new Error("network down"))
+      );
+      exitSpy.mockClear();
       const ctx = makeContext();
-      await func.call(ctx, DEFAULT_FLAGS, "my-app");
-      expect(runWizardSpy).not.toHaveBeenCalled();
-      expect(exitSpy).toHaveBeenCalledTimes(1);
-      expect(ctx.stderr.write).toHaveBeenCalledTimes(1);
+      await expect(func.call(ctx, DEFAULT_FLAGS)).rejects.toThrow(
+        "network down"
+      );
+      // Simulate what Stricli's exceptionWhileRunningCommand does after
+      // the func rejects — it sets process.exitCode before the setImmediate
+      // callback fires.
+      process.exitCode = 42;
+      await flushImmediates();
+      expect(exitSpy).toHaveBeenCalledWith(42);
+      process.exitCode = 0; // reset for subsequent tests
     });
   });
 });

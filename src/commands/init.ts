@@ -22,13 +22,7 @@ import type { SentryContext } from "../context.js";
 import { findProjectsBySlug } from "../lib/api/projects.js";
 import { looksLikePath, parseOrgProjectArg } from "../lib/arg-parsing.js";
 import { buildCommand } from "../lib/command.js";
-import { reportCliError } from "../lib/error-reporting.js";
-import {
-  CliError,
-  ContextError,
-  ValidationError,
-  WizardError,
-} from "../lib/errors.js";
+import { ContextError, ValidationError } from "../lib/errors.js";
 import { warmOrgDetection } from "../lib/init/org-prefetch.js";
 import { runWizard } from "../lib/init/wizard-runner.js";
 import { validateResourceId } from "../lib/input-validation.js";
@@ -176,95 +170,28 @@ async function resolveTarget(targetArg: string | undefined): Promise<{
 }
 
 /**
- * Core init flow extracted from the command `func` body so the wrapping
- * try/catch/finally in {@link initCommand} stays readable.
+ * Schedule a forced `process.exit` for after the current error-handling
+ * chain unwinds. `sentry init` is a terminal command: Bun's global fetch
+ * dispatcher (MastraClient) and the `/dev/tty` stream opened by
+ * `forwardFreshTtyToStdin` keep the libuv loop alive, so a natural exit
+ * hangs the shell. Using `setImmediate` (rather than exiting inline)
+ * lets Stricli's `exceptionWhileRunningCommand` run first — it reports to
+ * Sentry, sets `process.exitCode`, and renders the error — and only then
+ * does this callback fire and terminate the process with that code.
+ * See https://github.com/getsentry/cli/issues/798.
  */
-async function runInit(
-  ctx: SentryContext,
-  flags: InitFlags,
-  first: string | undefined,
-  second: string | undefined
-): Promise<void> {
-  // 1. Classify positionals into target vs directory
-  const { target: targetArg, directory: dirArg } = classifyArgs(first, second);
-
-  // 2. Resolve directory
-  const targetDir = dirArg ? path.resolve(ctx.cwd, dirArg) : ctx.cwd;
-
-  // 3. Parse features
-  const featuresList = flags.features
-    ?.flatMap((f) => f.split(FEATURE_DELIMITER))
-    .map((f) => f.trim())
-    .filter(Boolean);
-
-  // 4. Resolve target → org + project
-  //    Validation of user-provided slugs happens inside resolveTarget.
-  //    For bare slugs, if no existing project is found, the slug becomes
-  //    the name for a new project (org resolved later by the wizard).
-  const { org: explicitOrg, project: explicitProject } =
-    await resolveTarget(targetArg);
-
-  // 5. Start background org detection when org is not yet known.
-  //    The prefetch runs concurrently with the preamble, the wizard startup,
-  //    and all early suspend/resume rounds — by the time the wizard needs the
-  //    org (inside createSentryProject), the result is already cached.
-  if (!explicitOrg) {
-    warmOrgDetection(targetDir);
-  }
-
-  // 6. Run the wizard
-  await runWizard({
-    directory: targetDir,
-    yes: flags.yes,
-    dryRun: flags["dry-run"],
-    features: featuresList,
-    team: flags.team,
-    org: explicitOrg,
-    project: explicitProject,
+function scheduleForceExit(): void {
+  setImmediate(() => {
+    const code = process.exitCode;
+    if (typeof code === "number") {
+      process.exit(code);
+    }
+    if (typeof code === "string") {
+      const parsed = Number.parseInt(code, 10);
+      process.exit(Number.isNaN(parsed) ? 0 : parsed);
+    }
+    process.exit(0);
   });
-}
-
-/**
- * Report to Sentry and render the error message to stderr. Skips the
- * render for `WizardError.rendered=true` (clack already displayed it).
- */
-function handleInitError(stderr: SentryContext["stderr"], err: unknown): void {
-  // Stricli's exceptionWhileRunningCommand normally reports to Sentry
-  // (src/app.ts:327). Since we exit in `finally`, Stricli never sees
-  // the error — we own reporting here.
-  reportCliError(err);
-  if (err instanceof WizardError && err.rendered) {
-    return;
-  }
-  stderr.write(`Error: ${formatInitError(err)}\n`);
-}
-
-function formatInitError(err: unknown): string {
-  if (err instanceof CliError) {
-    return err.format();
-  }
-  if (err instanceof Error) {
-    return err.stack ?? err.message;
-  }
-  return String(err);
-}
-
-function exitCodeFor(caught: unknown): number {
-  if (caught instanceof CliError) {
-    return caught.exitCode;
-  }
-  if (caught !== undefined) {
-    return 1;
-  }
-  const existing = process.exitCode;
-  if (typeof existing === "number") {
-    return existing;
-  }
-  if (typeof existing === "string") {
-    const parsed = Number.parseInt(existing, 10);
-    return Number.isNaN(parsed) ? 0 : parsed;
-  }
-  return 0;
 }
 
 export const initCommand = buildCommand<
@@ -331,27 +258,58 @@ export const initCommand = buildCommand<
       t: "team",
     },
   },
-  // biome-ignore lint/correctness/useYield: command func is an async generator by buildCommand convention; final process.exit in the finally block terminates the function without yielding
   async *func(
     this: SentryContext,
     flags: InitFlags,
     first?: string,
     second?: string
   ) {
-    // `sentry init` is a terminal command. Bun's global fetch dispatcher
-    // (used by MastraClient) holds keep-alive sockets, and the fresh
-    // /dev/tty stream opened by forwardFreshTtyToStdin keeps the libuv
-    // loop alive — so a natural process exit hangs the shell. We force
-    // exit via `finally` on every path (success OR failure) to release
-    // those handles. See https://github.com/getsentry/cli/issues/798.
-    let caught: unknown;
     try {
-      await runInit(this, flags, first, second);
-    } catch (err) {
-      caught = err;
-      handleInitError(this.stderr, err);
+      // 1. Classify positionals into target vs directory
+      const { target: targetArg, directory: dirArg } = classifyArgs(
+        first,
+        second
+      );
+
+      // 2. Resolve directory
+      const targetDir = dirArg ? path.resolve(this.cwd, dirArg) : this.cwd;
+
+      // 3. Parse features
+      const featuresList = flags.features
+        ?.flatMap((f) => f.split(FEATURE_DELIMITER))
+        .map((f) => f.trim())
+        .filter(Boolean);
+
+      // 4. Resolve target → org + project
+      //    Validation of user-provided slugs happens inside resolveTarget.
+      //    For bare slugs, if no existing project is found, the slug becomes
+      //    the name for a new project (org resolved later by the wizard).
+      const { org: explicitOrg, project: explicitProject } =
+        await resolveTarget(targetArg);
+
+      // 5. Start background org detection when org is not yet known.
+      //    The prefetch runs concurrently with the preamble, the wizard startup,
+      //    and all early suspend/resume rounds — by the time the wizard needs the
+      //    org (inside createSentryProject), the result is already cached.
+      if (!explicitOrg) {
+        warmOrgDetection(targetDir);
+      }
+
+      // 6. Run the wizard
+      await runWizard({
+        directory: targetDir,
+        yes: flags.yes,
+        dryRun: flags["dry-run"],
+        features: featuresList,
+        team: flags.team,
+        org: explicitOrg,
+        project: explicitProject,
+      });
     } finally {
-      process.exit(exitCodeFor(caught));
+      // Fires on success AND failure. On error, the throw still propagates
+      // to Stricli, which reports + renders it before the scheduled exit
+      // runs. See scheduleForceExit() for the full rationale.
+      scheduleForceExit();
     }
   },
 });
